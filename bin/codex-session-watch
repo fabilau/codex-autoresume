@@ -1,0 +1,1817 @@
+#!/bin/bash
+# codex-session-watch
+#
+# Watches explicitly selected Codex desktop sessions and resumes them after
+# a usage-limit reset through the official local app-server daemon.
+#
+# IMPORTANT:
+#   - NO `codex exec resume`
+#   - NO Accessibility/AppleScript fallback
+#   - NO automatic resume for sessions that were not explicitly selected
+#   - A single managed Codex app-server daemon
+#
+# Commands:
+#   ./bin/codex-session-watch install
+#   ./bin/codex-session-watch select
+#   ./bin/codex-session-watch once
+#   ./bin/codex-session-watch status
+#   ./bin/codex-session-watch logs
+#   ./bin/codex-session-watch restart
+#   ./bin/codex-session-watch uninstall
+#   ./bin/codex-session-watch daemon-start
+#   ./bin/codex-session-watch daemon-stop
+#
+# Requirements:
+#   - macOS
+#   - managed Codex app-server daemon package
+#   - Swift compiler (Xcode Command Line Tools)
+#
+
+set -u
+set -o pipefail
+
+SCRIPT_VERSION="1.0.0"
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CONTINUE_PROMPT="${CONTINUE_PROMPT:-Continue}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
+ALLOW_LEGACY_RATE_FALLBACK="${ALLOW_LEGACY_RATE_FALLBACK:-0}"
+
+APP_NAME="codex-session-watch"
+LABEL="local.codex-session-watch"
+
+INSTALL_DIR="$HOME/.local/bin"
+INSTALL_SCRIPT="$INSTALL_DIR/$APP_NAME"
+
+STATE_DIR="$HOME/.local/state/$APP_NAME"
+HELPER_SOURCE="$STATE_DIR/SessionWatchClient.swift"
+HELPER_BIN="$STATE_DIR/session-watch-client"
+HELPER_VERSION_FILE="$STATE_DIR/helper-version"
+SELECTED_FILE="$STATE_DIR/selected-threads.txt"
+LOCK_DIR="$STATE_DIR/lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+DAEMON_MARKER="$STATE_DIR/daemon-started-by-watch"
+
+LOG_DIR="$HOME/Library/Logs/CodexSessionWatch"
+LOG_FILE="$LOG_DIR/watch.log"
+LAUNCHD_OUT="$LOG_DIR/launchd.stdout.log"
+LAUNCHD_ERR="$LOG_DIR/launchd.stderr.log"
+DAEMON_LOG="$LOG_DIR/remote-control.log"
+
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+REMOTE_SOCKET="$CODEX_HOME/app-server-control/app-server-control.sock"
+MANAGED_HELPER_BIN="$CODEX_HOME/packages/app-server-daemon/current/bin/codex"
+
+LOCK_ACQUIRED=0
+
+###############################################################################
+# General helpers
+###############################################################################
+
+ts() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+ensure_dirs() {
+    mkdir -p \
+        "$INSTALL_DIR" \
+        "$STATE_DIR" \
+        "$LOG_DIR" \
+        "$HOME/Library/LaunchAgents"
+
+    touch \
+        "$SELECTED_FILE" \
+        "$LOG_FILE" \
+        "$LAUNCHD_OUT" \
+        "$LAUNCHD_ERR" \
+        "$DAEMON_LOG"
+}
+
+log() {
+    ensure_dirs
+
+    local line
+    line="[$(ts)] $*"
+
+    printf '%s\n' "$line" >> "$LOG_FILE"
+
+    if [ -t 1 ]; then
+        printf '%s\n' "$line"
+    fi
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+positive_int() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) [ "$1" -gt 0 ] ;;
+    esac
+}
+
+xml() {
+    printf '%s' "$1" |
+        sed \
+            -e 's/&/\&amp;/g' \
+            -e 's/</\&lt;/g' \
+            -e 's/>/\&gt;/g' \
+            -e 's/"/\&quot;/g' \
+            -e "s/'/\&apos;/g"
+}
+
+managed_helper_installed() {
+    [ -x "$MANAGED_HELPER_BIN" ]
+}
+
+install_managed_helper_interactive() {
+    ensure_dirs
+
+    if managed_helper_installed; then
+        return 0
+    fi
+
+    printf '\n'
+    printf 'The Codex App Helper (managed app-server daemon) is not installed.\n'
+    printf 'It is required for remote control and will be installed at:\n\n'
+    printf '  %s\n\n' "$MANAGED_HELPER_BIN"
+    printf 'The daemon-only installer does not replace your regular Codex CLI.\n'
+    printf 'Install the Codex App Helper now? [y/N]: '
+
+    local answer=""
+    IFS= read -r answer || true
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            ;;
+        *)
+            log "Codex App Helper installation was cancelled."
+            return 1
+            ;;
+    esac
+
+    command -v curl >/dev/null 2>&1 || {
+        log "ERROR: curl was not found."
+        return 1
+    }
+
+    log "Installing Codex App Helper (daemon-only) ..."
+
+    if ! curl -fsSL https://chatgpt.com/codex/install.sh | \
+        env \
+            CODEX_HOME="$CODEX_HOME" \
+            CODEX_INSTALL_DAEMON_ONLY=1 \
+            CODEX_NON_INTERACTIVE=1 \
+            /bin/sh
+    then
+        log "Codex App Helper installation failed."
+        return 1
+    fi
+
+    if ! managed_helper_installed; then
+        log "ERROR: The installer completed, but the expected binary is missing: $MANAGED_HELPER_BIN"
+        return 1
+    fi
+
+    log "Codex App Helper installed: $MANAGED_HELPER_BIN"
+    return 0
+}
+
+ensure_managed_helper() {
+    local allow_prompt="${1:-0}"
+
+    if managed_helper_installed; then
+        return 0
+    fi
+
+    if [ "$allow_prompt" = "1" ] && [ -t 0 ]; then
+        install_managed_helper_interactive
+        return $?
+    fi
+
+    log "ERROR: Codex App Helper is missing: $MANAGED_HELPER_BIN"
+    log "Run '$0 select' or '$0 install' to be prompted for installation."
+    return 1
+}
+
+find_codex() {
+    if managed_helper_installed; then
+        printf '%s\n' "$MANAGED_HELPER_BIN"
+        return 0
+    fi
+
+    return 1
+}
+
+find_swiftc() {
+    if command -v swiftc >/dev/null 2>&1; then
+        command -v swiftc
+        return 0
+    fi
+
+    if command -v xcrun >/dev/null 2>&1; then
+        xcrun --find swiftc 2>/dev/null && return 0
+    fi
+
+    return 1
+}
+
+validate_config() {
+    positive_int "$CHECK_INTERVAL" ||
+        die "CHECK_INTERVAL must be a positive integer."
+}
+
+###############################################################################
+# Lock for periodic checks
+###############################################################################
+
+release_lock() {
+    [ "$LOCK_ACQUIRED" -eq 1 ] || return 0
+
+    if [ -f "$LOCK_PID_FILE" ]; then
+        if [ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" != "$$" ]; then
+            return 0
+        fi
+    fi
+
+    rm -rf "$LOCK_DIR"
+    LOCK_ACQUIRED=0
+}
+
+acquire_lock() {
+    ensure_dirs
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_PID_FILE"
+    else
+        local old_pid=""
+
+        if [ -f "$LOCK_PID_FILE" ]; then
+            old_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+        fi
+
+        if positive_int "$old_pid" && kill -0 "$old_pid" 2>/dev/null; then
+            log "Check skipped: PID $old_pid is already running."
+            return 1
+        fi
+
+        log "Removed stale lock."
+        rm -rf "$LOCK_DIR"
+
+        mkdir "$LOCK_DIR" 2>/dev/null || return 1
+        printf '%s\n' "$$" > "$LOCK_PID_FILE"
+    fi
+
+    LOCK_ACQUIRED=1
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    return 0
+}
+
+###############################################################################
+# Disable legacy watcher variants
+###############################################################################
+
+cleanup_old_variants() {
+    local old_label
+    local old_plist
+
+    for old_label in \
+        "local.codex-reset-watch" \
+        "local.chatgpt-app-session-watch" \
+        "local.chatgpt-session-watch"
+    do
+        launchctl bootout "gui/$(id -u)/$old_label" >/dev/null 2>&1 || true
+    done
+
+    for old_plist in \
+        "$HOME/Library/LaunchAgents/local.codex-reset-watch.plist" \
+        "$HOME/Library/LaunchAgents/local.chatgpt-app-session-watch.plist" \
+        "$HOME/Library/LaunchAgents/local.chatgpt-session-watch.plist"
+    do
+        rm -f "$old_plist"
+    done
+
+    rm -f \
+        "$HOME/.local/bin/codex-reset-watch.sh" \
+        "$HOME/.local/bin/chatgpt-app-session-watch.sh" \
+        "$HOME/.local/bin/chatgpt-session-watch.sh" \
+        "$HOME/.local/bin/codex-session-watch.sh"
+
+    rm -rf \
+        "$HOME/.local/state/codex-reset-watch/lock" \
+        "$HOME/.local/state/chatgpt-app-session-watch/lock" \
+        "$HOME/.local/state/chatgpt-session-watch/lock"
+}
+
+###############################################################################
+# Remote-control daemon
+###############################################################################
+
+remote_socket_ready() {
+    [ -S "$REMOTE_SOCKET" ]
+}
+
+ensure_daemon() {
+    local allow_prompt="${1:-0}"
+
+    ensure_dirs
+
+    ensure_managed_helper "$allow_prompt" || return 1
+
+    if remote_socket_ready; then
+        return 0
+    fi
+
+    local codex="$MANAGED_HELPER_BIN"
+
+    "$codex" app-server daemon --help >/dev/null 2>&1 || {
+        log "ERROR: The installed Codex App Helper does not support the managed app-server daemon."
+        return 1
+    }
+
+    log "Enabling remote control for the Codex app-server daemon ..."
+
+    if ! "$codex" app-server daemon enable-remote-control >> "$DAEMON_LOG" 2>&1; then
+        log "Enabling remote control failed. Last output:"
+        tail -n 30 "$DAEMON_LOG" 2>/dev/null | while IFS= read -r line; do
+            log "  $line"
+        done
+        return 1
+    fi
+
+    log "Starting Codex app-server daemon ..."
+
+    if ! "$codex" app-server daemon start >> "$DAEMON_LOG" 2>&1; then
+        log "Starting the daemon failed. Last output:"
+        tail -n 30 "$DAEMON_LOG" 2>/dev/null | while IFS= read -r line; do
+            log "  $line"
+        done
+        return 1
+    fi
+
+    touch "$DAEMON_MARKER"
+
+    local i=0
+    while [ "$i" -lt 100 ]; do
+        if remote_socket_ready; then
+            log "Remote-control socket is ready: $REMOTE_SOCKET"
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    log "The remote-control daemon reported success, but the socket is missing: $REMOTE_SOCKET"
+    return 1
+}
+
+stop_daemon_if_ours() {
+    [ -f "$DAEMON_MARKER" ] || return 0
+
+    if managed_helper_installed; then
+        "$MANAGED_HELPER_BIN" app-server daemon stop >> "$DAEMON_LOG" 2>&1 || true
+    fi
+
+    rm -f "$DAEMON_MARKER"
+}
+
+force_stop_daemon() {
+    ensure_managed_helper 1 || die "Codex App Helper is required."
+
+    "$MANAGED_HELPER_BIN" app-server daemon stop >> "$DAEMON_LOG" 2>&1 || true
+    rm -f "$DAEMON_MARKER"
+
+    log "Remote-control daemon stopped."
+}
+
+###############################################################################
+# Build the Swift app-server client
+###############################################################################
+
+write_helper_source() {
+    ensure_dirs
+
+    cat > "$HELPER_SOURCE" <<'SWIFT'
+import Foundation
+import Darwin
+
+private enum WatchError: Error, CustomStringConvertible {
+    case message(String)
+
+    var description: String {
+        switch self {
+        case .message(let value): return value
+        }
+    }
+}
+
+private func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(("ERROR: \(message)\n").data(using: .utf8)!)
+    exit(1)
+}
+
+private final class UnixWebSocket {
+    private var fd: Int32 = -1
+    private let writeLock = NSLock()
+
+    init(path: String) throws {
+        try connect(path: path)
+        try handshake()
+    }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        if fd >= 0 {
+            Darwin.close(fd)
+            fd = -1
+        }
+    }
+
+    private func connect(path: String) throws {
+        let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard socketFD >= 0 else {
+            throw WatchError.message("socket(AF_UNIX) failed: errno=\(errno)")
+        }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        #if os(macOS)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        #endif
+
+        let bytes = Array(path.utf8)
+        let maxPath = MemoryLayout.size(ofValue: address.sun_path)
+        guard bytes.count < maxPath else {
+            Darwin.close(socketFD)
+            throw WatchError.message("Socket path is too long")
+        }
+
+        withUnsafeMutablePointer(to: &address.sun_path) { ptr in
+            ptr.withMemoryRebound(to: UInt8.self, capacity: maxPath) { buffer in
+                for i in 0..<maxPath { buffer[i] = 0 }
+                for (index, byte) in bytes.enumerated() { buffer[index] = byte }
+            }
+        }
+
+        let rc = withUnsafePointer(to: &address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                Darwin.connect(socketFD, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+
+        guard rc == 0 else {
+            let e = errno
+            Darwin.close(socketFD)
+            throw WatchError.message("Failed to connect to the app-server socket: errno=\(e)")
+        }
+
+        var timeout = timeval(tv_sec: 30, tv_usec: 0)
+        withUnsafePointer(to: &timeout) { ptr in
+            _ = setsockopt(
+                socketFD,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                ptr,
+                socklen_t(MemoryLayout<timeval>.size)
+            )
+        }
+
+        fd = socketFD
+    }
+
+    private func handshake() throws {
+        var random = [UInt8](repeating: 0, count: 16)
+        for i in random.indices {
+            random[i] = UInt8.random(in: 0...255)
+        }
+        let key = Data(random).base64EncodedString()
+
+        // Build the request with explicit CRLF. With a Swift multiline string,
+        // the final source newline before the closing delimiter becomes
+        // part of the string. The previous version therefore ended with
+        // \r\n\r instead of the HTTP-required \r\n\r\n.
+        let request =
+            "GET / HTTP/1.1\r\n" +
+            "Host: localhost\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: \(key)\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "\r\n"
+
+        try writeAll(Data(request.utf8))
+
+        var response = Data()
+        let delimiter = Data("\r\n\r\n".utf8)
+
+        while response.range(of: delimiter) == nil {
+            var byte: UInt8 = 0
+            let n = Darwin.read(fd, &byte, 1)
+            guard n > 0 else {
+                throw WatchError.message("WebSocket handshake: connection closed")
+            }
+            response.append(byte)
+            if response.count > 64 * 1024 {
+                throw WatchError.message("WebSocket handshake is unexpectedly large")
+            }
+        }
+
+        guard let text = String(data: response, encoding: .utf8),
+              text.hasPrefix("HTTP/1.1 101") || text.hasPrefix("HTTP/1.0 101") else {
+            throw WatchError.message("WebSocket handshake rejected: \(String(data: response, encoding: .utf8) ?? "unreadable")")
+        }
+    }
+
+    func sendText(_ text: String) throws {
+        let payload = Array(text.utf8)
+        let frame = makeFrame(opcode: 0x1, payload: payload)
+
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try writeAll(frame)
+    }
+
+    func readText() throws -> String {
+        var fragmented: [UInt8] = []
+        var fragmentedOpcode: UInt8?
+
+        while true {
+            let firstTwo = try readExact(2)
+            let first = firstTwo[0]
+            let second = firstTwo[1]
+
+            let fin = (first & 0x80) != 0
+            let opcode = first & 0x0f
+            let masked = (second & 0x80) != 0
+
+            var length = UInt64(second & 0x7f)
+            if length == 126 {
+                let ext = try readExact(2)
+                length = (UInt64(ext[0]) << 8) | UInt64(ext[1])
+            } else if length == 127 {
+                let ext = try readExact(8)
+                length = 0
+                for byte in ext {
+                    length = (length << 8) | UInt64(byte)
+                }
+            }
+
+            guard length <= 64 * 1024 * 1024 else {
+                throw WatchError.message("WebSocket-Frame ist zu gross")
+            }
+
+            var mask: [UInt8] = []
+            if masked {
+                mask = try readExact(4)
+            }
+
+            var payload = try readExact(Int(length))
+            if masked {
+                for i in payload.indices {
+                    payload[i] ^= mask[i % 4]
+                }
+            }
+
+            switch opcode {
+            case 0x8:
+                throw WatchError.message("The app server closed the WebSocket connection")
+
+            case 0x9:
+                try sendControl(opcode: 0xA, payload: payload)
+                continue
+
+            case 0xA:
+                continue
+
+            case 0x1, 0x2:
+                if fin {
+                    if opcode == 0x1, let text = String(bytes: payload, encoding: .utf8) {
+                        return text
+                    }
+                    continue
+                }
+                fragmentedOpcode = opcode
+                fragmented = payload
+
+            case 0x0:
+                guard fragmentedOpcode != nil else { continue }
+                fragmented.append(contentsOf: payload)
+                if fin {
+                    let originalOpcode = fragmentedOpcode
+                    fragmentedOpcode = nil
+                    let complete = fragmented
+                    fragmented = []
+
+                    if originalOpcode == 0x1,
+                       let text = String(bytes: complete, encoding: .utf8) {
+                        return text
+                    }
+                }
+
+            default:
+                continue
+            }
+        }
+    }
+
+    private func sendControl(opcode: UInt8, payload: [UInt8]) throws {
+        let frame = makeFrame(opcode: opcode, payload: payload)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try writeAll(frame)
+    }
+
+    private func makeFrame(opcode: UInt8, payload: [UInt8]) -> Data {
+        var data = Data()
+        data.append(UInt8(0x80) | opcode)
+
+        let count = payload.count
+        if count < 126 {
+            data.append(UInt8(0x80) | UInt8(count))
+        } else if count <= 0xffff {
+            data.append(0x80 | 126)
+            data.append(UInt8((count >> 8) & 0xff))
+            data.append(UInt8(count & 0xff))
+        } else {
+            data.append(0x80 | 127)
+            let value = UInt64(count)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                data.append(UInt8((value >> UInt64(shift)) & 0xff))
+            }
+        }
+
+        let mask = (0..<4).map { _ in UInt8.random(in: 0...255) }
+        data.append(contentsOf: mask)
+
+        for (index, byte) in payload.enumerated() {
+            data.append(byte ^ mask[index % 4])
+        }
+
+        return data
+    }
+
+    private func readExact(_ count: Int) throws -> [UInt8] {
+        if count == 0 { return [] }
+
+        var result = [UInt8](repeating: 0, count: count)
+        var offset = 0
+
+        while offset < count {
+            let n = result.withUnsafeMutableBytes { rawBuffer -> Int in
+                guard let base = rawBuffer.baseAddress else { return -1 }
+                return Darwin.read(fd, base.advanced(by: offset), count - offset)
+            }
+
+            if n > 0 {
+                offset += n
+                continue
+            }
+
+            if n < 0 && errno == EINTR {
+                continue
+            }
+
+            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                throw WatchError.message("Timed out while reading from the app server")
+            }
+
+            throw WatchError.message("The app-server connection was closed while reading")
+        }
+
+        return result
+    }
+
+    private func writeAll(_ data: Data) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return }
+
+            var offset = 0
+            while offset < data.count {
+                let n = Darwin.write(fd, base.advanced(by: offset), data.count - offset)
+                if n > 0 {
+                    offset += n
+                    continue
+                }
+                if n < 0 && errno == EINTR {
+                    continue
+                }
+                throw WatchError.message("Writing to the app server failed: errno=\(errno)")
+            }
+        }
+    }
+}
+
+private final class RPCClient {
+    private let socket: UnixWebSocket
+    private var nextID = 1
+
+    init(socketPath: String) throws {
+        socket = try UnixWebSocket(path: socketPath)
+        try initialize()
+    }
+
+    private func initialize() throws {
+        _ = try request(
+            method: "initialize",
+            params: [
+                "clientInfo": [
+                    "name": "CodexSessionWatch",
+                    "title": NSNull(),
+                    "version": "1.0.0"
+                ],
+                "capabilities": [
+                    "experimentalApi": false,
+                    "requestAttestation": false
+                ]
+            ]
+        )
+
+        try notify(method: "initialized", params: [:])
+    }
+
+    func request(method: String, params: [String: Any]? = nil) throws -> [String: Any] {
+        let id = nextID
+        nextID += 1
+
+        var object: [String: Any] = [
+            "method": method,
+            "id": id
+        ]
+
+        if let params {
+            object["params"] = params
+        }
+
+        try socket.sendText(try Self.jsonString(object))
+
+        while true {
+            let text = try socket.readText()
+            guard let data = text.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                continue
+            }
+
+            if let responseID = object["id"] as? Int, responseID == id {
+                if let error = object["error"] as? [String: Any] {
+                    let code = error["code"] ?? "?"
+                    let message = error["message"] ?? "Unknown RPC error"
+                    throw WatchError.message("\(method): [\(code)] \(message)")
+                }
+
+                return object["result"] as? [String: Any] ?? [:]
+            }
+
+            // Notifications and messages unrelated to this request
+            // are not relevant to this small watcher client.
+        }
+    }
+
+    func notify(method: String, params: [String: Any]) throws {
+        var object: [String: Any] = ["method": method]
+        if !params.isEmpty {
+            object["params"] = params
+        }
+        try socket.sendText(try Self.jsonString(object))
+    }
+
+    private static func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw WatchError.message("JSON could not be encoded as UTF-8")
+        }
+        return string
+    }
+}
+
+private struct ThreadEntry {
+    let id: String
+    let title: String
+    let cwd: String
+    let status: String
+    let updatedAt: Int
+    let source: String
+}
+
+private func sourceDescription(_ value: Any?) -> String {
+    if let value = value as? String {
+        return value
+    }
+    if let value = value as? [String: Any] {
+        if value["subAgent"] != nil { return "subAgent" }
+        if let custom = value["custom"] as? String { return "custom:\(custom)" }
+    }
+    return "unknown"
+}
+
+private func statusDescription(_ value: Any?) -> String {
+    guard let dictionary = value as? [String: Any],
+          let type = dictionary["type"] as? String else {
+        return "unknown"
+    }
+    return type
+}
+
+private func cleanTitle(_ raw: String) -> String {
+    let oneLine = raw
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if oneLine.count <= 100 { return oneLine }
+    return String(oneLine.prefix(97)) + "..."
+}
+
+private func fetchDesktopThreads(_ client: RPCClient) throws -> [ThreadEntry] {
+    var cursor: String? = nil
+    var result: [ThreadEntry] = []
+    var seen = Set<String>()
+
+    repeat {
+        var params: [String: Any] = [
+            "limit": 100,
+            "sortKey": "recency_at",
+            "sortDirection": "desc",
+            "archived": false,
+            "useStateDbOnly": true
+            // sourceKinds is intentionally omitted: current Codex
+            // uses the unfiltered interactive path for
+            // Atlas/ChatGPT sessions as well. Filtering only to "vscode" can
+            // hide those sessions. The source is shown in the selector.
+        ]
+
+        if let cursor {
+            params["cursor"] = cursor
+        }
+
+        let response = try client.request(method: "thread/list", params: params)
+        let data = response["data"] as? [[String: Any]] ?? []
+
+        for thread in data {
+            guard let id = thread["id"] as? String, !id.isEmpty else { continue }
+            guard seen.insert(id).inserted else { continue }
+
+            if let parent = thread["parentThreadId"], !(parent is NSNull) {
+                continue
+            }
+
+            if (thread["ephemeral"] as? Bool) == true {
+                continue
+            }
+
+            let name = thread["name"] as? String
+            let preview = thread["preview"] as? String ?? ""
+            let title = cleanTitle((name?.isEmpty == false ? name! : preview).isEmpty ? "Untitled" : (name?.isEmpty == false ? name! : preview))
+            let cwd = thread["cwd"] as? String ?? ""
+            let updatedAt = thread["recencyAt"] as? Int ?? thread["updatedAt"] as? Int ?? 0
+            let status = statusDescription(thread["status"])
+            let source = sourceDescription(thread["source"])
+
+            result.append(ThreadEntry(
+                id: id,
+                title: title,
+                cwd: cwd,
+                status: status,
+                updatedAt: updatedAt,
+                source: source
+            ))
+        }
+
+        if let next = response["nextCursor"] as? String, !next.isEmpty {
+            cursor = next
+        } else {
+            cursor = nil
+        }
+    } while cursor != nil && result.count < 1000
+
+    return result.sorted { lhs, rhs in
+        if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+        return lhs.id < rhs.id
+    }
+}
+
+private func readSelection(_ path: String) -> Set<String> {
+    guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+        return []
+    }
+
+    return Set(
+        content
+            .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .map(String.init)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    )
+}
+
+private func writeSelection(_ ids: [String], path: String) throws {
+    let content = ids.sorted().joined(separator: "\n") + (ids.isEmpty ? "" : "\n")
+    try content.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
+private func formattedDate(_ epoch: Int) -> String {
+    guard epoch > 0 else { return "unknown" }
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+}
+
+private func parseSelection(_ text: String, count: Int) throws -> Set<Int> {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+    if trimmed == "all" {
+        return Set((1...max(count, 1)).filter { $0 <= count })
+    }
+
+    if trimmed == "none" || trimmed == "0" {
+        return []
+    }
+
+    var values = Set<Int>()
+    let normalized = trimmed.replacingOccurrences(of: " ", with: ",")
+
+    for tokenSub in normalized.split(separator: ",", omittingEmptySubsequences: true) {
+        let token = String(tokenSub)
+
+        if let dash = token.firstIndex(of: "-") {
+            let left = String(token[..<dash])
+            let right = String(token[token.index(after: dash)...])
+
+            guard let start = Int(left), let end = Int(right), start <= end else {
+                throw WatchError.message("Invalid range: \(token)")
+            }
+
+            for value in start...end {
+                guard value >= 1 && value <= count else {
+                    throw WatchError.message("Selection is outside the valid range: \(value)")
+                }
+                values.insert(value)
+            }
+        } else {
+            guard let value = Int(token), value >= 1, value <= count else {
+                throw WatchError.message("Invalid selection: \(token)")
+            }
+            values.insert(value)
+        }
+    }
+
+    return values
+}
+
+private struct ProjectGroup {
+    let cwd: String
+    let name: String
+    let threads: [ThreadEntry]
+    let updatedAt: Int
+}
+
+private func projectName(for cwd: String) -> String {
+    let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if trimmed.isEmpty {
+        return "No project"
+    }
+
+    let normalized = (trimmed as NSString).standardizingPath
+    let last = (normalized as NSString).lastPathComponent
+    return last.isEmpty ? normalized : last
+}
+
+private func buildProjects(_ threads: [ThreadEntry]) -> [ProjectGroup] {
+    let groups = Dictionary(grouping: threads) { thread -> String in
+        let cwd = thread.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cwd.isEmpty ? "__NO_PROJECT__" : cwd
+    }
+
+    return groups.map { key, values in
+        let cwd = key == "__NO_PROJECT__" ? "" : key
+        return ProjectGroup(
+            cwd: cwd,
+            name: projectName(for: cwd),
+            threads: values.sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id < rhs.id
+            },
+            updatedAt: values.map(\.updatedAt).max() ?? 0
+        )
+    }.sorted { lhs, rhs in
+        if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+}
+
+private func sessionSelectionForProject(
+    _ project: ProjectGroup,
+    selected: inout Set<String>,
+    selectionPath: String
+) throws {
+    while true {
+        print("")
+        print("Project: \(project.name)")
+        print(String(repeating: "=", count: max(9, min(80, project.name.count + 9))))
+
+        if !project.cwd.isEmpty {
+            print("Path: \(project.cwd)")
+        }
+
+        print("")
+
+        for (index, thread) in project.threads.enumerated() {
+            let mark = selected.contains(thread.id) ? "x" : " "
+            let number = String(format: "%3d", index + 1)
+            print("[\(mark)] \(number)  \(thread.status.padding(toLength: 10, withPad: " ", startingAt: 0))  \(thread.title)")
+            print("         last updated: \(formattedDate(thread.updatedAt))   source: \(thread.source)")
+            print("         ID: \(thread.id)")
+            print("")
+        }
+
+        print("Choose the sessions in this project that may be resumed automatically.")
+        print("This selection only replaces the choices in THIS project.")
+        print("Examples: 1,2,5-7   |   all   |   none")
+        print("Empty input or 'back' = return to project selection without changes.")
+        print("")
+        print("Session-Selection: ", terminator: "")
+        fflush(stdout)
+
+        guard let input = readLine() else {
+            throw WatchError.message("No input received")
+        }
+
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = trimmed.lowercased()
+
+        if trimmed.isEmpty || lowered == "back" || lowered == "b" {
+            return
+        }
+
+        do {
+            let indices = try parseSelection(trimmed, count: project.threads.count)
+            let projectIDs = Set(project.threads.map(\.id))
+            let chosenIDs = Set(indices.map { project.threads[$0 - 1].id })
+
+            selected.subtract(projectIDs)
+            selected.formUnion(chosenIDs)
+
+            try writeSelection(Array(selected), path: selectionPath)
+
+            print("")
+            print("Project saved: \(chosenIDs.count) of \(project.threads.count) session(s) selected.")
+            print("Returning to project selection ...")
+            return
+        } catch {
+            print("")
+            print("Invalid selection: \(error)")
+            print("Please try again.")
+        }
+    }
+}
+
+private func runSelect(client: RPCClient, selectionPath: String) throws {
+    let threads = try fetchDesktopThreads(client)
+
+    guard !threads.isEmpty else {
+        throw WatchError.message("No non-archived interactive sessions found.")
+    }
+
+    let projects = buildProjects(threads)
+    var selected = readSelection(selectionPath)
+
+    // Remove IDs that no longer appear in the current active list,
+    // so stale/deactivated sessions do not remain in the selection file forever.
+    let visibleIDs = Set(threads.map(\.id))
+    selected = selected.intersection(visibleIDs)
+    try writeSelection(Array(selected), path: selectionPath)
+
+    while true {
+        print("")
+        print("Codex project selection")
+        print("===================")
+        print("")
+
+        for (index, project) in projects.enumerated() {
+            let selectedCount = project.threads.filter { selected.contains($0.id) }.count
+            let number = String(format: "%3d", index + 1)
+            let marker = selectedCount > 0 ? "x" : " "
+
+            print("[\(marker)] \(number)  \(project.name)   (\(selectedCount)/\(project.threads.count) selected)")
+            if !project.cwd.isEmpty {
+                print("         \(project.cwd)")
+            }
+            print("         last updated: \(formattedDate(project.updatedAt))")
+            print("")
+        }
+
+        print("  0  Done / finish selection")
+        print("")
+        print("Project: ", terminator: "")
+        fflush(stdout)
+
+        guard let input = readLine() else {
+            throw WatchError.message("No input received")
+        }
+
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = trimmed.lowercased()
+
+        if trimmed == "0" || lowered == "done" || lowered == "finish" || lowered == "q" {
+            try writeSelection(Array(selected), path: selectionPath)
+            print("")
+            if selected.isEmpty {
+                print("No session selected. Automatic resume is disabled.")
+            } else {
+                print("Selection complete: \(selected.count) session(s) enabled in total.")
+            }
+            return
+        }
+
+        guard let projectNumber = Int(trimmed),
+              projectNumber >= 1,
+              projectNumber <= projects.count else {
+            print("")
+            print("Invalid project. Enter a number from 1 to \(projects.count), or 0 to finish.")
+            continue
+        }
+
+        try sessionSelectionForProject(
+            projects[projectNumber - 1],
+            selected: &selected,
+            selectionPath: selectionPath
+        )
+    }
+}
+
+private enum RatePermission {
+    case allowed(String)
+    case blocked(String)
+    case unknown(String)
+}
+
+private func rateSummary(_ response: [String: Any]) -> String {
+    guard let snapshot = response["rateLimits"] as? [String: Any] else {
+        return "no rate-limit details"
+    }
+
+    var parts: [String] = []
+
+    if let reached = snapshot["rateLimitReachedType"] as? String {
+        parts.append("reached=\(reached)")
+    }
+
+    if let primary = snapshot["primary"] as? [String: Any] {
+        if let used = primary["usedPercent"] as? NSNumber {
+            parts.append("primary=\(used.intValue)%")
+        }
+        if let reset = primary["resetsAt"] as? NSNumber {
+            parts.append("reset=\(formattedDate(reset.intValue))")
+        }
+    }
+
+    return parts.isEmpty ? "no rate-limit details" : parts.joined(separator: ", ")
+}
+
+private func readRatePermission(_ client: RPCClient) throws -> RatePermission {
+    let response = try client.request(method: "account/rateLimits/read", params: [:])
+    let summary = rateSummary(response)
+
+    if let allowed = response["ordinaryUsageAllowed"] as? Bool {
+        return allowed ? .allowed(summary) : .blocked(summary)
+    }
+
+    let legacyAllowed = ProcessInfo.processInfo.environment["ALLOW_LEGACY_RATE_FALLBACK"] == "1"
+    if legacyAllowed,
+       let snapshot = response["rateLimits"] as? [String: Any] {
+        let reached = snapshot["rateLimitReachedType"] as? String
+        let primary = snapshot["primary"] as? [String: Any]
+        let used = (primary?["usedPercent"] as? NSNumber)?.doubleValue
+
+        if reached == nil && (used == nil || used! < 100.0) {
+            return .allowed("Legacy-Fallback: \(summary)")
+        }
+        return .blocked("Legacy-Fallback: \(summary)")
+    }
+
+    return .unknown("ordinaryUsageAllowed is unavailable; \(summary)")
+}
+
+private func latestTurn(_ client: RPCClient, threadID: String) throws -> [String: Any]? {
+    let response = try client.request(
+        method: "thread/turns/list",
+        params: [
+            "threadId": threadID,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded"
+        ]
+    )
+
+    return (response["data"] as? [[String: Any]])?.first
+}
+
+private func isUsageLimitFailure(_ turn: [String: Any]) -> Bool {
+    guard (turn["status"] as? String) == "failed",
+          let error = turn["error"] as? [String: Any] else {
+        return false
+    }
+
+    if let info = error["codexErrorInfo"] as? String,
+       info == "usageLimitExceeded" {
+        return true
+    }
+
+    let message = (error["message"] as? String ?? "").lowercased()
+    return message.contains("usagelimitexceeded") || message.contains("usage limit")
+}
+
+private func continueThread(_ client: RPCClient, threadID: String, prompt: String) throws -> String {
+    _ = try client.request(
+        method: "thread/resume",
+        params: [
+            "threadId": threadID,
+            "excludeTurns": true
+        ]
+    )
+
+    do {
+        let response = try client.request(
+            method: "turn/start",
+            params: [
+                "threadId": threadID,
+                "input": [[
+                    "type": "text",
+                    "text": prompt,
+                    "text_elements": []
+                ]]
+            ]
+        )
+
+        let turn = response["turn"] as? [String: Any]
+        let turnID = turn?["id"] as? String ?? "unknown"
+        let status = turn?["status"] as? String ?? "unknown"
+
+        // Current app-server code removes only this connection's subscription
+        // connection; the started turn is not terminated by this.
+        _ = try? client.request(
+            method: "thread/unsubscribe",
+            params: ["threadId": threadID]
+        )
+
+        return "turn=\(turnID), status=\(status)"
+    } catch {
+        _ = try? client.request(
+            method: "thread/unsubscribe",
+            params: ["threadId": threadID]
+        )
+        throw error
+    }
+}
+
+private func runOnce(client: RPCClient, selectionPath: String, prompt: String) throws {
+    let selected = readSelection(selectionPath)
+
+    if selected.isEmpty {
+        print("No session selected; nothing to do.")
+        return
+    }
+
+    let permission = try readRatePermission(client)
+
+    switch permission {
+    case .blocked(let details):
+        print("Usage limit is still active; no session will be resumed. \(details)")
+        return
+
+    case .unknown(let details):
+        print("Rate-limit status cannot be determined safely; no session will be resumed. \(details)")
+        return
+
+    case .allowed(let details):
+        print("Ordinary usage ist erlaubt. \(details)")
+    }
+
+    let allThreads = try fetchDesktopThreads(client)
+    let lookup = Dictionary(uniqueKeysWithValues: allThreads.map { ($0.id, $0) })
+
+    var continued = 0
+    var skipped = 0
+    var failed = 0
+
+    for threadID in selected.sorted() {
+        let title = lookup[threadID]?.title ?? threadID
+
+        do {
+            guard let turn = try latestTurn(client, threadID: threadID) else {
+                print("Skipped: \(title) - no turn found")
+                skipped += 1
+                continue
+            }
+
+            guard isUsageLimitFailure(turn) else {
+                let status = turn["status"] as? String ?? "unknown"
+                print("Skipped: \(title) - last turn is \(status), not a usage-limit failure")
+                skipped += 1
+                continue
+            }
+
+            let result = try continueThread(client, threadID: threadID, prompt: prompt)
+            print("Resumed: \(title) - \(result)")
+            continued += 1
+        } catch {
+            print("ERROR for \(title): \(error)")
+            failed += 1
+        }
+    }
+
+    print("Result: resumed=\(continued), skipped=\(skipped), errors=\(failed), selected=\(selected.count)")
+
+    if failed > 0 {
+        exit(2)
+    }
+}
+
+private func runStatus(client: RPCClient, selectionPath: String) throws {
+    let selected = readSelection(selectionPath)
+    let threads = try fetchDesktopThreads(client)
+    let lookup = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+
+    print("Selected sessions: \(selected.count)")
+
+    if selected.isEmpty {
+        print("  none")
+        return
+    }
+
+    for id in selected.sorted() {
+        if let thread = lookup[id] {
+            print("  - \(thread.title)")
+            print("    status=\(thread.status), id=\(id)")
+        } else {
+            print("  - \(id) (no longer visible in thread/list)")
+        }
+    }
+}
+
+let args = CommandLine.arguments
+
+guard args.count >= 3 else {
+    fail("Usage: session-watch-client <select|once|status> <selection-file> [prompt]")
+}
+
+let command = args[1]
+let selectionPath = args[2]
+let prompt = args.count >= 4 ? args[3] : "Continue"
+let home = FileManager.default.homeDirectoryForCurrentUser.path
+let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] ?? home + "/.codex"
+let socketPath = ProcessInfo.processInfo.environment["CODEX_REMOTE_SOCKET"] ?? codexHome + "/app-server-control/app-server-control.sock"
+
+do {
+    let client = try RPCClient(socketPath: socketPath)
+
+    switch command {
+    case "select":
+        try runSelect(client: client, selectionPath: selectionPath)
+
+    case "once":
+        try runOnce(client: client, selectionPath: selectionPath, prompt: prompt)
+
+    case "status":
+        try runStatus(client: client, selectionPath: selectionPath)
+
+    default:
+        throw WatchError.message("Unbekannter Befehl: \(command)")
+    }
+} catch {
+    fail(String(describing: error))
+}
+SWIFT
+}
+
+build_helper() {
+    ensure_dirs
+    write_helper_source
+
+    local swiftc
+    swiftc="$(find_swiftc)" ||
+        die "Swift compiler not found. Install the Xcode Command Line Tools with: xcode-select --install"
+
+    log "Kompiliere lokalen App-Server-Client ..."
+
+    "$swiftc" \
+        -O \
+        -o "$HELPER_BIN" \
+        "$HELPER_SOURCE" ||
+        die "The Swift client could not be compiled."
+
+    chmod 755 "$HELPER_BIN"
+    printf '%s\n' "$SCRIPT_VERSION" > "$HELPER_VERSION_FILE"
+}
+
+ensure_helper() {
+    local installed_version=""
+
+    if [ -f "$HELPER_VERSION_FILE" ]; then
+        installed_version="$(cat "$HELPER_VERSION_FILE" 2>/dev/null || true)"
+    fi
+
+    if [ ! -x "$HELPER_BIN" ] || [ "$installed_version" != "$SCRIPT_VERSION" ]; then
+        log "Swift helper is missing or outdated; rebuilding version $SCRIPT_VERSION."
+        build_helper
+    fi
+}
+
+###############################################################################
+# LaunchAgent
+###############################################################################
+
+unload_agent() {
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true
+}
+
+write_plist() {
+    cat > "$PLIST" <<EOF_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(xml "$INSTALL_SCRIPT")</string>
+        <string>once</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>$CHECK_INTERVAL</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$(xml "$HOME")</string>
+
+        <key>CODEX_HOME</key>
+        <string>$(xml "$CODEX_HOME")</string>
+
+        <key>CONTINUE_PROMPT</key>
+        <string>$(xml "$CONTINUE_PROMPT")</string>
+
+        <key>CHECK_INTERVAL</key>
+        <string>$CHECK_INTERVAL</string>
+
+        <key>ALLOW_LEGACY_RATE_FALLBACK</key>
+        <string>$(xml "$ALLOW_LEGACY_RATE_FALLBACK")</string>
+
+        <key>PATH</key>
+        <string>$(xml "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>$(xml "$LAUNCHD_OUT")</string>
+
+    <key>StandardErrorPath</key>
+    <string>$(xml "$LAUNCHD_ERR")</string>
+</dict>
+</plist>
+EOF_PLIST
+
+    plutil -lint "$PLIST" >/dev/null ||
+        die "LaunchAgent plist is invalid."
+}
+
+ensure_installed_script_copy() {
+    ensure_dirs
+
+    local src
+    src="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    if [ "$src" = "$INSTALL_SCRIPT" ]; then
+        chmod 755 "$INSTALL_SCRIPT" 2>/dev/null || true
+        return 0
+    fi
+
+    if [ ! -f "$INSTALL_SCRIPT" ] || ! cmp -s "$src" "$INSTALL_SCRIPT"; then
+        log "Updating installed script copy: $INSTALL_SCRIPT"
+        cp "$src" "$INSTALL_SCRIPT" || return 1
+        chmod 755 "$INSTALL_SCRIPT" || return 1
+    fi
+
+    return 0
+}
+
+enable_agent_if_selected() {
+    ensure_dirs
+
+    if [ ! -s "$SELECTED_FILE" ]; then
+        unload_agent
+        rm -f "$PLIST"
+        log "No session selected; LaunchAgent remains disabled."
+        return 0
+    fi
+
+    ensure_installed_script_copy ||
+        die "Installed script copy could not be updated: $INSTALL_SCRIPT"
+
+    write_plist
+    unload_agent
+
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" ||
+        die "LaunchAgent could not be loaded."
+
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+
+    log "LaunchAgent is active (interval ${CHECK_INTERVAL}s)."
+}
+
+###############################################################################
+# Helper invocations
+###############################################################################
+
+run_helper_logged() {
+    local tmp="$STATE_DIR/helper-output.$$.log"
+    local rc=0
+
+    CODEX_HOME="$CODEX_HOME" \
+    CODEX_REMOTE_SOCKET="$REMOTE_SOCKET" \
+    ALLOW_LEGACY_RATE_FALLBACK="$ALLOW_LEGACY_RATE_FALLBACK" \
+        "$HELPER_BIN" "$@" > "$tmp" 2>&1 || rc=$?
+
+    while IFS= read -r line; do
+        log "$line"
+    done < "$tmp"
+
+    rm -f "$tmp"
+    return "$rc"
+}
+
+select_sessions() {
+    ensure_dirs
+    ensure_daemon 1 || die "Remote-control daemon could not be started."
+    ensure_helper
+
+    if ! CODEX_HOME="$CODEX_HOME" \
+         CODEX_REMOTE_SOCKET="$REMOTE_SOCKET" \
+            "$HELPER_BIN" select "$SELECTED_FILE"
+    then
+        die "Session selection through the app server failed."
+    fi
+
+    enable_agent_if_selected
+}
+
+run_once() {
+    ensure_dirs
+    validate_config
+
+    log "Check started (version $SCRIPT_VERSION)."
+
+    if [ ! -s "$SELECTED_FILE" ]; then
+        log "No session selected; check finished."
+        return 0
+    fi
+
+    acquire_lock || return 0
+
+    ensure_daemon 0 || {
+        log "Remote-control daemon is not available."
+        return 1
+    }
+
+    ensure_helper
+
+    run_helper_logged once "$SELECTED_FILE" "$CONTINUE_PROMPT"
+}
+
+###############################################################################
+# Install / status / uninstall
+###############################################################################
+
+install_watch() {
+    ensure_dirs
+    validate_config
+    cleanup_old_variants
+
+    local src
+    src="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    ensure_managed_helper 1 ||
+        die "Codex App Helper is required for installation."
+
+    "$MANAGED_HELPER_BIN" app-server daemon --help >/dev/null 2>&1 ||
+        die "The installed Codex App Helper does not support the managed app-server daemon."
+
+    log "Installing $APP_NAME, version $SCRIPT_VERSION."
+
+    if [ "$src" != "$INSTALL_SCRIPT" ]; then
+        cp "$src" "$INSTALL_SCRIPT" ||
+            die "Main script could not be copied to $INSTALL_SCRIPT."
+    fi
+    chmod 755 "$INSTALL_SCRIPT"
+
+    build_helper
+    ensure_daemon 1 || die "Remote-control daemon could not be started."
+
+    log "Choose the sessions that may be resumed automatically."
+
+    if ! CODEX_HOME="$CODEX_HOME" \
+         CODEX_REMOTE_SOCKET="$REMOTE_SOCKET" \
+            "$HELPER_BIN" select "$SELECTED_FILE"
+    then
+        die "Session selection through the app server failed."
+    fi
+
+    enable_agent_if_selected
+
+    log "Installation completed."
+    log "  Main script: $INSTALL_SCRIPT"
+    log "  Helper:      $HELPER_BIN"
+    log "  Selection:   $SELECTED_FILE"
+    log "  Socket:      $REMOTE_SOCKET"
+    log "  Log:         $LOG_FILE"
+}
+
+show_status() {
+    ensure_dirs
+
+    printf '\n'
+    printf 'Codex Session Watch\n'
+    printf '===================\n\n'
+    printf 'Version:       %s\n' "$SCRIPT_VERSION"
+    printf 'CODEX_HOME:    %s\n' "$CODEX_HOME"
+    printf 'App Helper:    %s\n' "$MANAGED_HELPER_BIN"
+    if managed_helper_installed; then
+        printf 'Helper status: installed\n'
+    else
+        printf 'Helper status: NOT installed\n'
+    fi
+    printf 'Socket:        %s\n' "$REMOTE_SOCKET"
+
+    if remote_socket_ready; then
+        printf 'Remote control: ready\n'
+    else
+        printf 'Remote control: NOT ready\n'
+    fi
+
+    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        printf 'LaunchAgent:   active\n'
+    else
+        printf 'LaunchAgent:   inactive\n'
+    fi
+
+    local count=0
+    if [ -f "$SELECTED_FILE" ]; then
+        count="$(awk 'NF { n++ } END { print n + 0 }' "$SELECTED_FILE")"
+    fi
+    printf 'Selected:      %s session(s)\n' "$count"
+    printf '\n'
+
+    if remote_socket_ready && [ -x "$HELPER_BIN" ]; then
+        CODEX_HOME="$CODEX_HOME" \
+        CODEX_REMOTE_SOCKET="$REMOTE_SOCKET" \
+            "$HELPER_BIN" status "$SELECTED_FILE" || true
+    fi
+
+    printf '\nMain log: %s\n' "$LOG_FILE"
+    printf 'Daemon log: %s\n' "$DAEMON_LOG"
+    printf 'launchd stderr: %s\n' "$LAUNCHD_ERR"
+    printf '\n'
+}
+
+restart_watch() {
+    ensure_dirs
+    rm -rf "$LOCK_DIR"
+
+    ensure_daemon 1 || die "Remote-control daemon could not be started."
+    enable_agent_if_selected
+    log "Watcher restarted."
+}
+
+uninstall_watch() {
+    ensure_dirs
+
+    unload_agent
+
+    rm -f \
+        "$PLIST" \
+        "$INSTALL_SCRIPT" \
+        "$HELPER_BIN" \
+        "$HELPER_SOURCE" \
+        "$HELPER_VERSION_FILE"
+
+    rm -rf "$LOCK_DIR"
+
+    stop_daemon_if_ours
+
+    log "Watcher uninstalled."
+    log "Selection state and logs are kept for troubleshooting."
+    log "Remove everything with: rm -rf '$STATE_DIR' '$LOG_DIR'"
+}
+
+show_logs() {
+    ensure_dirs
+    tail -n 100 -f "$LOG_FILE"
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+case "${1:-status}" in
+    install)
+        install_watch
+        ;;
+
+    select)
+        select_sessions
+        ;;
+
+    once|run)
+        run_once
+        ;;
+
+    status)
+        show_status
+        ;;
+
+    restart)
+        restart_watch
+        ;;
+
+    logs)
+        show_logs
+        ;;
+
+    daemon-start)
+        ensure_daemon 1 || exit 1
+        ;;
+
+    daemon-stop)
+        force_stop_daemon
+        ;;
+
+    uninstall)
+        uninstall_watch
+        ;;
+
+    *)
+        cat <<EOF_USAGE
+Usage:
+
+  $0 install
+      Installs the watcher, starts the remote-control daemon, and requires
+      explicit session selection.
+
+  $0 select
+      Walks through Project -> Session selection. After each project, it returns
+      to the project list. If the Codex App Helper is missing, installation is offered.
+
+  $0 once
+      Runs a check immediately.
+
+  $0 status
+      Shows daemon, LaunchAgent, and session status.
+
+  $0 logs
+      Follows the watcher log.
+
+  $0 restart
+      Reloads the LaunchAgent.
+
+  $0 daemon-start
+      Starts only the Codex remote-control daemon.
+
+  $0 daemon-stop
+      Stops the Codex remote-control daemon.
+
+  $0 uninstall
+      Removes the watcher and LaunchAgent. A remote-control daemon started by
+      this watcher is stopped as well.
+
+Environment variables:
+
+  CONTINUE_PROMPT
+      Default: Continue
+
+  CHECK_INTERVAL
+      Default: 60 seconds
+
+  ALLOW_LEGACY_RATE_FALLBACK
+      Default: 0
+      Set to 1 only for older app-server versions without ordinaryUsageAllowed.
+
+EOF_USAGE
+        exit 2
+        ;;
+esac
